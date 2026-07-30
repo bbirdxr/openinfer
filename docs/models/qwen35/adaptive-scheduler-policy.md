@@ -3,7 +3,13 @@
 > **TL;DR:** Issue #727 now lands Qwen3.5 scheduler policy plumbing with
 > conservative defaults: `off` remains the default, `auto` is explicit opt-in,
 > `--max-prefill-tokens` remains a hard per-step cap, and TP rejects `auto`
-> instead of silently downgrading to `off`.
+> instead of silently downgrading to `off`. The independent validation track
+> (`scripts/sweep_727.sh` + `run_serving_bench.sh` QPS A/B) is prepared but its
+> acceptance numbers are **pending a reachable GPU**. Because `auto` is
+> cap-preserving and only fires a decode-priority tick when an active decode has
+> ≤4 tokens remaining, it is expected neutral on the standard/QPS/long-output
+> guards, and the current `mixed` harness cannot cleanly stage that tick — see
+> the Independent Validation Track section.
 >
 > **Last touched:** 2026-07
 
@@ -145,5 +151,68 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
   - A `max_batch=4,bg=4` mixed cell is a negative control, not evidence of overlap.
   - Qwen3.5 TP should reject `auto` until TP supports unified mixed steps.
 - **Follow-ups**:
-  - A future mixed-load trace can add explicit per-step `prefill_tok` and `decode_n` fields; that would make #470-style overlap validity visible without relying on the capacity gate.
-  - Wider QPS pressure and active-decode-width cells from #727 acceptance remain the next benchmark expansion before any default-readiness wording.
+  - **Run the prepared #727 acceptance matrix** (`scripts/sweep_727.sh` plus the two `run_serving_bench.sh` QPS A/B lines it prints) once a GPU is reachable, then replace the pre-review §5 cells with the real off-vs-auto evidence.
+  - **Exercise `auto` cleanly**: add a background-stream replenish option to `mixed.rs` so active decodes reach the ≤4-token decode-finish window while a cold prefill is in flight — the only way to turn the "clear mixed-load ITL tail improvement" criterion into a measurable cell (see the measurement gap in the Independent Validation Track section).
+
+## Independent Validation Track (#727 acceptance)
+
+> Owner: `bbirdxr` — validation only; PR #730 owns the policy and this track
+> starts no second scheduler. The GitHub #727 thread scopes it to: retain the
+> #470 `ITL_STEP` overlap validity gate (stall buckets from step timestamps, not
+> the `[submit, last-token]` window), run the missing `1024/128` QPS 8/12/16
+> cells, add long-output concurrency, cover wider active-decode batches than
+> `bg_concurrency=4`, and report p50/p99/max + TTFT + throughput +
+> completions/failures + output lengths/hashes + saturated cells without hiding
+> regressions.
+
+### Measurement design (derived from the merged `auto` semantics)
+
+`choose_prefill_budget` (`openinfer-qwen35/src/scheduler/plan.rs`) makes `auto`
+differ from `off` only by (1) a decode-priority tick (budget 0) when some active
+decode has ≤4 tokens remaining and (2) trimming the final chunk to the remaining
+prompt; it never exceeds `--max-prefill-tokens`. Two consequences drive the
+matrix:
+
+- On the standard `1024/256` c1/c16, `1024/128` QPS 8/12/16, and long-output
+  concurrency cells the fixed chunk path is preserved, so `auto` is expected
+  **neutral** — that neutrality *is* the "no material regression" acceptance bar.
+- The mixed cells reuse the proven #470 long-lived-background workload (a huge
+  `--bg-output-len` keeps `decode_n == bg_concurrency`, so the validity gate
+  holds) extended to wider active-decode batches (`bg ∈ {8,16}`, `max_batch =
+  2·bg`) and the `auto`/`off` axis. Under this workload the ≤4-token window is
+  never hit, so `auto == off` by construction: these cells prove `auto` does
+  **not** regress the mixed tail; they do not show a tail *improvement*.
+
+**Open measurement gap.** Cleanly exercising the decode-finish tick needs active
+decodes that reach completion *while a cold prefill is in flight*. The current
+`mixed` bench spawns a fixed background set and never replenishes it, so bounding
+the background output only collapses `decode_n` (breaking the #470 gate) instead
+of staging a controlled finish. A clean "mixed ITL tail improved" cell is
+therefore the `mixed.rs` replenish follow-up above. The remaining acceptance
+criteria (no regression, explicit failures, retained output hashes, disableable
+`off`) are measurable now.
+
+### Harness
+
+- `scripts/sweep_727.sh` — in-process cells (standard c1/c16, long-output c8,
+  the wider-batch mixed matrix, and the `max_batch == bg` negative control), run
+  once per policy with per-cell JSON + log and the `ITL_STEP` gate. It reuses the
+  existing `bench_serving` flags; no bench code change.
+- `tools/bench/run_serving_bench.sh` now forwards `FEATURES` /
+  `QWEN35_SCHED_POLICY` / `MAX_BATCH` to the openinfer server, so the open-loop
+  `1024/128` @ qps 8/12/16 pressure cells can be A/B'd off vs auto over HTTP.
+- Policy-decision unit coverage already lives in `scheduler/plan.rs`
+  (`adaptive_prefill_budget_*`); this track only adds serving-level evidence.
+
+### Status
+
+Harness landed and `bash -n`-checked on the Mac authoring host. **The acceptance
+run is blocked on a reachable GPU** — the RTX 5090/4090 hosts in `~/.ssh/config`
+require VPN and were unreachable at authoring time, and no `prime`/`gh`
+credentials are configured locally. Resume once a GPU is reachable:
+
+```bash
+cargo build --release -p openinfer-server --bin bench_serving --features qwen35
+MODEL=<absolute Qwen3.5-4B path> scripts/sweep_727.sh
+# then run the two run_serving_bench.sh QPS A/B lines printed by the sweep footer
+```

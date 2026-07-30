@@ -27,6 +27,9 @@
 #   VLLM             path to vllm binary for ENGINE=vllm [default: vllm on PATH]
 #   VLLM_EXTRA_ARGS  extra args passed to `vllm serve` [default: "--max-model-len 8192"]
 #   LABEL            engine label for result filenames [default: $ENGINE]
+#   FEATURES             cargo features for the openinfer build (e.g. "qwen35")
+#   QWEN35_SCHED_POLICY  off|auto — Qwen3.5 adaptive scheduler policy (issue #727)
+#   MAX_BATCH            Qwen3.5 scheduler admission cap (server --max-batch)
 #
 # Examples:
 #   # openinfer Qwen3-4B QPS sweep
@@ -85,12 +88,23 @@ case "$ENGINE" in
     BINARY="$REPO_ROOT/target/release/openinfer"
     if [[ "$SKIP_BUILD" != "1" ]]; then
       echo "=== building openinfer (SKIP_BUILD=1 to skip) ==="
-      (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p openinfer-server)
+      # shellcheck disable=SC2086
+      (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p openinfer-server ${FEATURES:+--features "$FEATURES"})
     fi
     SERVER_EXTRA_ARGS=()
     if [[ -n "$DRAFT_MODEL" ]]; then
       SERVER_EXTRA_ARGS+=(--dflash-draft-model-path "$DRAFT_MODEL")
       MODEL_LABEL="${MODEL_LABEL}-dspark"
+    fi
+    # Qwen3.5 adaptive scheduler A/B (issue #727): forward the policy + admission
+    # cap to the server and tag results so off/auto files stay distinct. Empty
+    # env keeps the historical behavior (server default: policy off).
+    if [[ -n "${QWEN35_SCHED_POLICY:-}" ]]; then
+      SERVER_EXTRA_ARGS+=(--qwen35-scheduler-policy "$QWEN35_SCHED_POLICY")
+      LABEL="${LABEL}-${QWEN35_SCHED_POLICY}"
+    fi
+    if [[ -n "${MAX_BATCH:-}" ]]; then
+      SERVER_EXTRA_ARGS+=(--max-batch "$MAX_BATCH")
     fi
     echo "=== launching openinfer: model=$MODEL gpu=$GPU port=$PORT draft=${DRAFT_MODEL:-none} ==="
     CUDA_VISIBLE_DEVICES=$GPU "$BINARY" \
