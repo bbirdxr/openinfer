@@ -52,7 +52,10 @@ PORT=${PORT:-8000}
 RESULT_DIR=${RESULT_DIR:-./bench-results}
 DATASET=${DATASET:-random}
 QPS_LIST=${QPS_LIST-"1 2 4 8 10 12 16"}
-CONCURRENCY_LIST=${CONCURRENCY_LIST:-"1 4 8"}
+# Use `-` (not `:-`) so an explicitly empty CONCURRENCY_LIST disables the
+# concurrency sweep — matching QPS_LIST. `:-` treated "" as unset and always
+# re-enabled the default "1 4 8" sweep.
+CONCURRENCY_LIST=${CONCURRENCY_LIST-"1 4 8"}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 SEED=${SEED:-42}

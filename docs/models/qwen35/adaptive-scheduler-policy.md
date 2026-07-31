@@ -1,15 +1,14 @@
 # Qwen3.5 Adaptive Scheduler Policy
 
-> **TL;DR:** Issue #727 now lands Qwen3.5 scheduler policy plumbing with
-> conservative defaults: `off` remains the default, `auto` is explicit opt-in,
-> `--max-prefill-tokens` remains a hard per-step cap, and TP rejects `auto`
-> instead of silently downgrading to `off`. The independent validation track
-> (`scripts/sweep_727.sh` + `run_serving_bench.sh` QPS A/B) is prepared but its
-> acceptance numbers are **pending a reachable GPU**. Because `auto` is
-> cap-preserving and only fires a decode-priority tick when an active decode has
-> ≤4 tokens remaining, it is expected neutral on the standard/QPS/long-output
-> guards, and the current `mixed` harness cannot cleanly stage that tick — see
-> the Independent Validation Track section.
+> **TL;DR:** Issue #727 policy plumbing stays default-`off` / opt-in `auto` with
+> a hard `--max-prefill-tokens` cap and TP rejection of `auto`. Independent
+> acceptance on **1×RTX 4090** (`scripts/sweep_727.sh`, commit `428c037`) shows
+> `auto` vs `off` **neutral** on standard/long-output cells (deltas ≤0.5%) and
+> **no mixed-tail regression** under the #470 `ITL_STEP` validity gate (all
+> wider-batch mixed cells valid; `max_batch==bg` negctl correctly invalid).
+> HTTP `1024/128` QPS 8/12/16 A/B is in the harness; re-persist after the first
+> 4090 host was idle-killed mid-run (see Status). Decode-finish *improvement*
+> still needs the `mixed.rs` replenish follow-up.
 >
 > **Last touched:** 2026-07
 
@@ -151,7 +150,7 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
   - A `max_batch=4,bg=4` mixed cell is a negative control, not evidence of overlap.
   - Qwen3.5 TP should reject `auto` until TP supports unified mixed steps.
 - **Follow-ups**:
-  - **Run the prepared #727 acceptance matrix** (`scripts/sweep_727.sh` plus the two `run_serving_bench.sh` QPS A/B lines it prints) once a GPU is reachable, then replace the pre-review §5 cells with the real off-vs-auto evidence.
+  - **Persist HTTP QPS A/B** (`1024/128` @ qps 8/12/16, off vs auto) to shared storage after the first 4090 host (`tasks/645702`) was idle-killed mid-run; in-process sweep evidence below already stands.
   - **Exercise `auto` cleanly**: add a background-stream replenish option to `mixed.rs` so active decodes reach the ≤4-token decode-finish window while a cold prefill is in flight — the only way to turn the "clear mixed-load ITL tail improvement" criterion into a measurable cell (see the measurement gap in the Independent Validation Track section).
 
 ## Independent Validation Track (#727 acceptance)
@@ -204,15 +203,74 @@ criteria (no regression, explicit failures, retained output hashes, disableable
 - Policy-decision unit coverage already lives in `scheduler/plan.rs`
   (`adaptive_prefill_budget_*`); this track only adds serving-level evidence.
 
-### Status
+### Status — 4090 acceptance (in-process sweep complete)
 
-Harness landed and `bash -n`-checked on the Mac authoring host. **The acceptance
-run is blocked on a reachable GPU** — the RTX 5090/4090 hosts in `~/.ssh/config`
-require VPN and were unreachable at authoring time, and no `prime`/`gh`
-credentials are configured locally. Resume once a GPU is reachable:
+Validation host (separate baseline from the §5 RTX 5090 pre-review cells; do
+**not** compare absolute latencies across hosts):
+
+| Field | Value |
+| --- | --- |
+| GPU | 1× NVIDIA GeForce RTX 4090 24GB (Cybertron `openinfer-dev` / `paratera_ningxia`, task `645702`) |
+| Driver / CUDA | driver `570.133.07`, `nvcc 12.1` |
+| Rust | `nightly-2026-07-10` |
+| Source | branch tip `428c037` (`chore/qwen35-727-validation-0c33`) |
+| Feature / model | `qwen35`, `models/Qwen3.5-4B` (`model_type=qwen3_5`) |
+| Build env | `OPENINFER_CUDA_SM=89`, `OPENINFER_SKIP_SUBMODULE_INIT=1` (qwen35 only needs flashinfer+cutlass/spdlog/cccl), Triton `3.7.1` |
+| Sweep | `scripts/sweep_727.sh` — **24/24 cells `exit=0`**, `SWEEP_DONE` 2026-07-31T06:06:44Z |
+
+Standard / long-output request A/B (synthetic greedy; CUDA Graph on; hash0
+identical off vs auto):
+
+| Policy | Cell | TTFT p50 ms | steady TPOT p50/p99 ms | request tok/s | out len | hash0 |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `off` | 1024/256 c1 | 64.838 | 10.925 / 11.020 | 89.80 | 256 | `0827a7035c7b7a89` |
+| `auto` | 1024/256 c1 | 65.185 | 10.920 / 11.006 | 89.84 | 256 | `0827a7035c7b7a89` |
+| `off` | 1024/256 c16 | 677.727 | 15.004 / 79.230 | 51.76 | 256 | `0827a7035c7b7a89` |
+| `auto` | 1024/256 c16 | 678.530 | 15.061 / 79.558 | 51.60 | 256 | `0827a7035c7b7a89` |
+| `off` | 1024/2048 c8 | 372.810 | 12.729 / 13.359 | 76.98 | 2048 | `dc6c576de0d38289` |
+| `auto` | 1024/2048 c8 | 373.581 | 12.781 / 13.375 | 76.79 | 2048 | `dc6c576de0d38289` |
+
+`(auto−off)/off` deltas: TTFT ≤ +0.53%, TPOT p50 ≤ +0.41%, TPOT p99 ≤ +0.41% —
+**no material regression** on the fixed-chunk path.
+
+Mixed-load `#470` `ITL_STEP` validity (stall step with `prefill_tok>0` and
+`decode_n == bg_concurrency`):
+
+| Cell family | off valid? | auto valid? |
+| --- | --- | --- |
+| `mixed_bg{8,16}_mb{16,32}_p{4096,8192}_q{0p5,1p0}_*` (16 cells) | yes (`stall_at_bg` > 0) | yes |
+| `mixed_negctl_bg8_mb8_*` (`max_batch == bg`) | **no** (`stall_at_bg=0`, starvation warning) | **no** |
+
+Representative stall ITL from `itl_step_agg.py` (`mixed_bg8_mb16_p4096_q0p5`):
+
+| Policy | stall p50/p99/max ms | steady decode p50/p99 ms | stall steps @ `decode_n=8` |
+| --- | ---: | ---: | ---: |
+| `off` | 78.33 / 83.00 / 91.69 | 12.25 / 12.82 | 40 |
+| `auto` | 47.81 / 79.18 / 79.30 | 12.25 / 12.75 | 40 |
+
+Interpretation: under the long-lived-background matrix, `auto` does **not**
+regress the true per-step stall / steady decode tails vs `off`, and the
+negctl still detects slot starvation. This does **not** claim a decode-finish
+tick improvement (measurement gap above).
+
+HTTP QPS pressure (`tools/bench/run_serving_bench.sh`, `1024/128`, qps 8/12/16,
+`MAX_BATCH=16`, `FEATURES=qwen35`): harness exercised on the same host; the
+preemptible / idle-auto-release window killed the pod before results were
+copied off `/root`. Re-run on a fresh 4090 with results under `/user/...` and
+paste the summarize table here. Harness fix landed: empty
+`CONCURRENCY_LIST=` must disable the concurrency sweep (`:-` → `-` in
+`run_serving_bench.sh`).
+
+Resume / re-persist:
 
 ```bash
-cargo build --release -p openinfer-server --bin bench_serving --features qwen35
-MODEL=<absolute Qwen3.5-4B path> scripts/sweep_727.sh
-# then run the two run_serving_bench.sh QPS A/B lines printed by the sweep footer
+export OPENINFER_SKIP_SUBMODULE_INIT=1 OPENINFER_CUDA_SM=89
+cargo build --release -p openinfer-server --features qwen35
+MODEL=<abs Qwen3.5-4B> DATA=<abs shared outdir> scripts/sweep_727.sh
+FEATURES=qwen35 QWEN35_SCHED_POLICY=off  MAX_BATCH=16 QPS_LIST='8 12 16' \
+  CONCURRENCY_LIST= INPUT_LEN=1024 OUTPUT_LEN=128 SKIP_BUILD=1 \
+  MODEL=$MODEL RESULT_DIR=$DATA/qps_off  tools/bench/run_serving_bench.sh
+FEATURES=qwen35 QWEN35_SCHED_POLICY=auto MAX_BATCH=16 QPS_LIST='8 12 16' \
+  CONCURRENCY_LIST= INPUT_LEN=1024 OUTPUT_LEN=128 SKIP_BUILD=1 \
+  MODEL=$MODEL RESULT_DIR=$DATA/qps_auto tools/bench/run_serving_bench.sh
 ```

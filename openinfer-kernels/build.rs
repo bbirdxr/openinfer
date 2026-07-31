@@ -125,6 +125,12 @@ fn crate_root() -> PathBuf {
 }
 
 fn ensure_git_submodules_initialized(repo_root: &Path) {
+    // Opt out when the caller already initialized the feature-required subset
+    // (e.g. flashinfer for qwen35) and must not recurse into moe/glm-only
+    // giants (DeepEP/FlashMLA/DeepGEMM/nixl) over a flaky github path.
+    if std::env::var_os("OPENINFER_SKIP_SUBMODULE_INIT").is_some() {
+        return;
+    }
     if !repo_root.join(".git").exists() || !repo_root.join(".gitmodules").is_file() {
         return;
     }
