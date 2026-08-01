@@ -115,6 +115,19 @@ def report(label, path):
     print(fmt(summarize_us([s["dur"] for s in stall_steps])))
     print("  steady decode steps (prefill_tok=0, decode_n>0):")
     print(fmt(summarize_us([s["dur"] for s in decode_steps])))
+    if stall_steps:
+        # Attribution axis: which forwarded-chunk shape produced which stall
+        # duration. `prefill_reqs > 1` means the step co-packed several queued
+        # prefills, which is exactly what the `auto` FIFO-front cap suppresses.
+        print("  stall dur split by forwarded chunk shape:")
+        by_shape = {}
+        for s in stall_steps:
+            by_shape.setdefault((s["ptok"], s["preqs"]), []).append(s["dur"])
+        for (tok, reqs), durs in sorted(by_shape.items()):
+            print(
+                f"    prefill_tok={tok} prefill_reqs={reqs}:"
+                + fmt(summarize_us(durs)).rstrip()
+            )
     ptok_dist = Counter(s["ptok"] for s in prefill_steps)
     print("  prefill_tok distribution (chunk sizes actually forwarded):")
     for tok, cnt in sorted(ptok_dist.items()):
