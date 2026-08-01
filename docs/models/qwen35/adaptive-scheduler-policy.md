@@ -6,13 +6,14 @@
 > task `650826`) shows `auto` vs `off` **neutral** on standard/long-output
 > (deltas ≤0.5%, identical hash0) and **no mixed-tail regression** under the
 > #470 `ITL_STEP` gate (16/16 wider-batch cells `stall_at_bg>0`; negctl
-> `decode_n==bg` absent + starvation warning). HTTP `1024/128` QPS 8/12/16:
-> ITL p99 matches; out tok/s −3.2%…−5.6% with TTFT up but TPOT p50 *down* on
-> `auto` — report, do not hide; attributed to the decode-priority tick firing on
-> ~40% of prefill-bearing steps at `output_len=128`, falsifiable with a
-> `1024/512` cell. The mixed stall p50 drop is reported but **not** attributed,
-> and a decode-finish *improvement* still needs the `mixed.rs` replenish
-> follow-up.
+> `decode_n==bg` absent + starvation warning). HTTP `1024/128` QPS 8/12/16: ITL
+> p99 matches; out tok/s −3.2%…−5.6%, reproduced (same-policy control: 0.15%) and
+> **fully attributed** — the decode-priority tick inserts 885 extra decode-only
+> steps (+10.5 s wall) and buys TPOT p50 −17% in exchange. The mixed stall p50
+> drop is attributed too, to co-packing suppression, which *raises* total stall
+> time 5.7% — so it is a distribution artifact, not a win. Both are
+> latency/throughput trades, which is why `auto` stays opt-in. A decode-finish
+> *improvement* still needs the `mixed.rs` replenish follow-up.
 >
 > **Last touched:** 2026-08
 
@@ -156,8 +157,7 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
 - **Follow-ups**:
   - **Exercise `auto` cleanly**: add a background-stream replenish option to `mixed.rs` so active decodes reach the ≤4-token decode-finish window while a cold prefill is in flight — the only way to turn the "clear mixed-load ITL tail improvement" criterion into a measurable cell (see the measurement gap in the Independent Validation Track section).
   - HTTP QPS A/B is now persisted under `/user/xurui1/oi727/datasets/qwen35-727-validation/` (task `650826`); see Status below.
-  - **Attribute the mixed stall p50 drop**: align per-step `prefill_tok` against step duration in the `mixed_bg8_mb16_p4096_q0p5` `auto` `.log` to confirm or kill the clause-(2) co-packing candidate. Until then the 79.58 → 48.48 p50 delta is reported, not claimed.
-  - **Falsify the QPS attribution**: run `1024/512` QPS 8/12/16 off vs auto. If the tick is the cause, the window share falls from `4/128` to `4/512` (hit rate ~40% → ~12%) and the out tok/s gap should shrink with it.
+  - Both deltas are now attributed from `ITL_STEP` step accounting (see Status): the mixed stall p50 drop is co-packing suppression (total stall time +5.7%), and the HTTP throughput loss is 885 extra decode-only steps from the decode-priority tick. Neither is unexplained any more, so the remaining open item is the improvement side below.
 
 ## Independent Validation Track (#727 acceptance)
 
@@ -216,6 +216,27 @@ criteria (no regression, explicit failures, retained output hashes, disableable
 - Policy-decision unit coverage already lives in `scheduler/plan.rs`
   (`adaptive_prefill_budget_*`); this track only adds serving-level evidence.
 
+Attribution runs re-use the same script with `OPENINFER_ITL_DEBUG=1` exported, so
+the server emits one `ITL_STEP` line per scheduler step and `itl_step_agg.py` can
+split stalls by forwarded chunk shape:
+
+```bash
+export OPENINFER_ITL_DEBUG=1
+FEATURES=qwen35 QWEN35_SCHED_POLICY=auto MAX_BATCH=16 QPS_LIST=16 \
+  CONCURRENCY_LIST= INPUT_LEN=1024 OUTPUT_LEN=128 SECONDS_PER_RUN=60 \
+  SKIP_BUILD=1 MODEL=models/Qwen3.5-4B RESULT_DIR=itl2_auto \
+  tools/bench/run_serving_bench.sh
+python3 scripts/itl_step_agg.py --label off --label auto \
+  itl2_off/server-openinfer-*.log itl2_auto/server-openinfer-*.log
+```
+
+Pass `QWEN35_SCHED_POLICY` as a literal. An empty value makes
+`run_serving_bench.sh` skip `--qwen35-scheduler-policy` entirely and the server
+falls back to its default `off`, so both arms silently measure the same policy —
+the tell is a result filename without the `-off` / `-auto` label, and step-for-step
+identical `ITL_STEP` accounting. Enabling `ITL_STEP` also costs throughput, so
+compare only within a debug-enabled pair, never against a non-debug run.
+
 ### Status — 4090 acceptance (in-process + HTTP QPS complete)
 
 Two preemptible 4090 hosts; absolute latencies are host-local (do **not**
@@ -267,19 +288,28 @@ Representative true per-step stall ITL (`mixed_bg8_mb16_p4096_q0p5`,
 | `off` | 79.58 / 85.55 / 88.45 | 12.31 / 12.87 | 40 |
 | `auto` | 48.48 / 83.75 / 84.71 | 12.34 / 12.86 | 40 |
 
-Interpretation: under the long-lived-background matrix, `auto` does **not**
-regress the true per-step stall / steady decode tails vs `off`, and the
-negctl still detects slot starvation. This does **not** claim a decode-finish
-tick improvement: clause (1) cannot fire in this workload (measurement gap
-above), and the stall p50 drop is **not yet attributed**. Note its shape — p50
-79.58 → 48.48 while p99/max barely move, so roughly half the stall steps got
-cheaper rather than all of them. The candidate is clause (2): a 512-token
-background prefill at the FIFO front caps that step at 512 tokens where `off`
-would co-pack 512 more from the injection chunk, and a `12.3 ms +
-0.066 ms/token` step fit puts 512 tokens at ~46 ms (observed 48.48) against
-~80 ms for 1024 (observed 79.58). Settling it needs the per-step `prefill_tok`
-histogram from the cell `.log` aligned against step duration. Until then this
-p50 delta is not quotable as a win.
+Interpretation: `auto` does **not** regress the true per-step stall or steady
+decode tails, and the negctl still detects slot starvation. The stall p50 drop
+is now attributed — and it is **not** a win. Splitting stall steps by forwarded
+chunk shape (`itl_step_agg.py`) shows the entire delta is clause (2) suppressing
+co-packing:
+
+| Forwarded shape | off | auto |
+| --- | ---: | ---: |
+| `prefill_tok=512 reqs=1` | 5 steps @ 47.70 ms | **47** steps @ 47.20 ms |
+| `prefill_tok=1024 reqs=1` | 40 steps @ 79.06 ms | 40 steps @ 78.78 ms |
+| `prefill_tok=1024 reqs=2` | **21** steps @ 80.22 ms | **none** |
+| all stall steps | 66 (avg 77.33 ms) | 87 (avg 62.03 ms) |
+
+The 21 co-packed `off` steps become 42 single-request 512-token steps under
+`auto` (`5 + 42 = 47`, `66 + 21 = 87`), while the 40 injection chunks are
+identical on both — the policy never touches the injection path in this cell.
+So p50 fell because the distribution was split, not because anything ran
+faster: total stall time *rises* from 5104 ms to 5397 ms (**+5.7%**), since every
+split step pays the ~12 ms per-step fixed cost again. `openinfer-qwen3`'s
+`DEFAULT_MAX_PREFILL_TOKENS` comment already records this effect from the other
+direction ("512 chunks no longer amortize the per-step fixed cost, so prefill
+falls behind arrivals and TTFT queues up").
 
 HTTP QPS pressure on `650826` (`tools/bench/run_serving_bench.sh`, `1024/128`,
 qps 8/12/16, `MAX_BATCH=16`, `FEATURES=qwen35`, `CONCURRENCY_LIST=` empty,
@@ -300,19 +330,50 @@ Completions = prompts (0 failures). Treat the throughput/TTFT delta as
 **reported**, not hidden; it is within the open-loop saturated regime where both
 policies already deliver ~5.0–5.3 req/s against offered 8–16.
 
-Attribution: clause (1), the decode-priority tick. The signature fits it — decode
-gets *better* (TPOT p50) while prefill pays for it (TTFT p50/p99 up, out tok/s
-down), which is what moving step budget from prefill to decode looks like. So
-does the magnitude: with `--output-len 128` every request spends its last 4
-tokens inside the window, so across 16 active decodes the chance that *some*
-request sits in the window is `1 − (31/32)^16 ≈ 40%`, i.e. about two in five
-prefill-bearing steps are forced to budget 0. Clause (2) cannot contribute here —
-a 1024-token prompt against the 1024 base budget makes the FIFO-front cap a
-no-op.
+**Attribution (settled).** Clause (1), the decode-priority tick, measured directly
+by re-running qps 16 with `OPENINFER_ITL_DEBUG=1` (artifacts in
+`itl2_{off,auto}/`):
 
-The attribution is falsifiable: the window share is `4/output_len`, so a
-`1024/512` cell should drop the hit rate to ~12% and shrink the throughput gap
-with it. Run that cell before quoting the mechanism as established.
+| Step accounting @ qps 16 | off | auto |
+| --- | ---: | ---: |
+| total `ITL_STEP` | 7698 | 8583 |
+| decode-only steps | 6738 | **7623** |
+| prefill-executing steps | 960 | 960 |
+| co-packed steps (`prefill_reqs=2`) | 4 | **0** |
+| wall time | 182.2 s | 192.7 s |
+
+The prefill work is identical — 960 prefill-executing steps either way. `auto`
+just inserts **885 extra decode-only steps**, which at the measured 15.05 ms
+steady decode step is ~10.6 s of extra wall time against an observed +10.5 s
+(182.2 → 192.7 s). That accounts for the whole throughput delta. Clause (2) is
+negligible here: `INPUT_LEN=1024` equals the 1024 base budget, so there are only
+4 co-packed steps to suppress. The TPOT p50 gain (23.24 → 19.36 ms) is the same
+mechanism seen from the decode side — this is a latency/throughput trade, not a
+defect.
+
+The effect reproduces rather than drifts: the re-run gives off 674.6 / auto 637.8
+out tok/s against the original 675.3 / 637.6. A same-policy control (two
+consecutive `off` runs) differed by **0.15%**, so a ~5.5% gap sits far outside
+run-to-run noise. Caveat: `ITL_STEP` logging is enabled in these two runs, so
+their absolute numbers are not comparable to the table above — only off-vs-auto
+within them is.
+
+Cross-check at `1024/512` (same qps 16, `SECONDS_PER_RUN=20`, 320 prompts,
+artifacts in `out512_{off,auto}/`):
+
+| `1024/512` @ qps 16 | off | auto | delta |
+| --- | ---: | ---: | ---: |
+| out tok/s | 909.4 | 891.9 | **−1.9%** |
+| decode-only steps | 9937 | 10222 | **+285** |
+| TPOT p50 ms | 17.48 | 16.50 | −5.6% |
+
+The extra decode-only steps scale with *completed requests*, not with wall time:
+`285/885 = 0.32` against `320/960 = 0.33`. The tick therefore fires ~0.9 times
+per completed request in both shapes — well under the 4-token window depth,
+because it also needs a prefill in flight to have anything to defer. Quadrupling
+`output_len` dilutes that fixed per-request cost across 4× more generated tokens,
+so the throughput gap shrinks 5.5% → 1.9% and the TPOT gain shrinks with it. The
+trade is real, and its size is predictable from `output_len`.
 
 Ops note for future preemptible re-runs: keep heartbeat aggressive (≤5s + GPU
 query), write all artifacts under `/user/...` on the **same** cluster FS, and

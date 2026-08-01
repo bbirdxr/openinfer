@@ -21,7 +21,10 @@ a chunk-ON vs chunk-OFF log to see chunking bound the per-step freeze.
 
 Usage:
     python3 scripts/itl_step_agg.py LOG [LOG ...]
-    python3 scripts/itl_step_agg.py --label on canonical_on.log --label off canonical_off.log
+    python3 scripts/itl_step_agg.py --label off --label auto off.log auto.log
+
+All `--label` flags must precede the log paths (argparse cannot interleave an
+`append` option with a positional `nargs="+"`); the Nth label names the Nth log.
 """
 
 import argparse
