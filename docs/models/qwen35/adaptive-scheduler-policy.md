@@ -7,9 +7,12 @@
 > (deltas ≤0.5%, identical hash0) and **no mixed-tail regression** under the
 > #470 `ITL_STEP` gate (16/16 wider-batch cells `stall_at_bg>0`; negctl
 > `decode_n==bg` absent + starvation warning). HTTP `1024/128` QPS 8/12/16:
-> ITL p99 matches; out tok/s −3.2%…−5.6% and TTFT p50 slightly higher on
-> `auto` — report, do not hide. Decode-finish *improvement* still needs the
-> `mixed.rs` replenish follow-up.
+> ITL p99 matches; out tok/s −3.2%…−5.6% with TTFT up but TPOT p50 *down* on
+> `auto` — report, do not hide; attributed to the decode-priority tick firing on
+> ~40% of prefill-bearing steps at `output_len=128`, falsifiable with a
+> `1024/512` cell. The mixed stall p50 drop is reported but **not** attributed,
+> and a decode-finish *improvement* still needs the `mixed.rs` replenish
+> follow-up.
 >
 > **Last touched:** 2026-08
 
@@ -153,6 +156,8 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
 - **Follow-ups**:
   - **Exercise `auto` cleanly**: add a background-stream replenish option to `mixed.rs` so active decodes reach the ≤4-token decode-finish window while a cold prefill is in flight — the only way to turn the "clear mixed-load ITL tail improvement" criterion into a measurable cell (see the measurement gap in the Independent Validation Track section).
   - HTTP QPS A/B is now persisted under `/user/xurui1/oi727/datasets/qwen35-727-validation/` (task `650826`); see Status below.
+  - **Attribute the mixed stall p50 drop**: align per-step `prefill_tok` against step duration in the `mixed_bg8_mb16_p4096_q0p5` `auto` `.log` to confirm or kill the clause-(2) co-packing candidate. Until then the 79.58 → 48.48 p50 delta is reported, not claimed.
+  - **Falsify the QPS attribution**: run `1024/512` QPS 8/12/16 off vs auto. If the tick is the cause, the window share falls from `4/128` to `4/512` (hit rate ~40% → ~12%) and the out tok/s gap should shrink with it.
 
 ## Independent Validation Track (#727 acceptance)
 
@@ -169,9 +174,13 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
 
 `choose_prefill_budget` (`openinfer-qwen35/src/scheduler/plan.rs`) makes `auto`
 differ from `off` only by (1) a decode-priority tick (budget 0) when some active
-decode has ≤4 tokens remaining and (2) trimming the final chunk to the remaining
-prompt; it never exceeds `--max-prefill-tokens`. Two consequences drive the
-matrix:
+decode has ≤4 tokens remaining and (2) capping the step budget at the FIFO-front
+request's remaining prompt; it never exceeds `--max-prefill-tokens`. Clause (2)
+is more than a final-chunk trim: `take_prefill_chunks` spends the step budget
+across the whole prefill *queue*, so capping it at the front request also stops
+that step from co-packing the next queued prefill (unit-pinned by
+`adaptive_prefill_budget_stops_step_from_copacking_queued_prefills`). Two
+consequences drive the matrix:
 
 - On the standard `1024/256` c1/c16, `1024/128` QPS 8/12/16, and long-output
   concurrency cells the fixed chunk path is preserved, so `auto` is expected
@@ -179,9 +188,12 @@ matrix:
 - The mixed cells reuse the proven #470 long-lived-background workload (a huge
   `--bg-output-len` keeps `decode_n == bg_concurrency`, so the validity gate
   holds) extended to wider active-decode batches (`bg ∈ {8,16}`, `max_batch =
-  2·bg`) and the `auto`/`off` axis. Under this workload the ≤4-token window is
-  never hit, so `auto == off` by construction: these cells prove `auto` does
-  **not** regress the mixed tail; they do not show a tail *improvement*.
+  2·bg`) and the `auto`/`off` axis. The same huge `--bg-output-len` also puts the
+  ≤4-token window out of reach (4/8192 per background stream), so clause (1)
+  effectively never fires here: these cells prove `auto` does **not** regress the
+  mixed tail; they do not show a decode-finish tail *improvement*. Clause (2) can
+  still bind, because `--bg-prompt-len 512` sits below the 1024 base budget —
+  see the unattributed stall p50 drop in Status.
 
 **Open measurement gap.** Cleanly exercising the decode-finish tick needs active
 decodes that reach completion *while a cold prefill is in flight*. The current
@@ -258,7 +270,16 @@ Representative true per-step stall ITL (`mixed_bg8_mb16_p4096_q0p5`,
 Interpretation: under the long-lived-background matrix, `auto` does **not**
 regress the true per-step stall / steady decode tails vs `off`, and the
 negctl still detects slot starvation. This does **not** claim a decode-finish
-tick improvement (measurement gap above).
+tick improvement: clause (1) cannot fire in this workload (measurement gap
+above), and the stall p50 drop is **not yet attributed**. Note its shape — p50
+79.58 → 48.48 while p99/max barely move, so roughly half the stall steps got
+cheaper rather than all of them. The candidate is clause (2): a 512-token
+background prefill at the FIFO front caps that step at 512 tokens where `off`
+would co-pack 512 more from the injection chunk, and a `12.3 ms +
+0.066 ms/token` step fit puts 512 tokens at ~46 ms (observed 48.48) against
+~80 ms for 1024 (observed 79.58). Settling it needs the per-step `prefill_tok`
+histogram from the cell `.log` aligned against step duration. Until then this
+p50 delta is not quotable as a win.
 
 HTTP QPS pressure on `650826` (`tools/bench/run_serving_bench.sh`, `1024/128`,
 qps 8/12/16, `MAX_BATCH=16`, `FEATURES=qwen35`, `CONCURRENCY_LIST=` empty,
@@ -274,10 +295,24 @@ qps 8/12/16, `MAX_BATCH=16`, `FEATURES=qwen35`, `CONCURRENCY_LIST=` empty,
 | `auto` | 16 | 960 | 4.98 | 637.6 | 63750 / 128829 | 19.63 / 23.07 | 82.63 |
 
 `(auto−off)/off` on out tok/s: −4.1% / −3.2% / −5.6% at qps 8/12/16. ITL p99 is
-flat; TPOT p50 is slightly *better* on `auto`. Completions = prompts (0
-failures). Treat the throughput/TTFT delta as **reported**, not hidden; it is
-within the open-loop saturated regime where both policies already deliver
-~5.0–5.3 req/s against offered 8–16.
+flat; TPOT p50 is slightly *better* on `auto` (23.19 → 19.63 at qps 16).
+Completions = prompts (0 failures). Treat the throughput/TTFT delta as
+**reported**, not hidden; it is within the open-loop saturated regime where both
+policies already deliver ~5.0–5.3 req/s against offered 8–16.
+
+Attribution: clause (1), the decode-priority tick. The signature fits it — decode
+gets *better* (TPOT p50) while prefill pays for it (TTFT p50/p99 up, out tok/s
+down), which is what moving step budget from prefill to decode looks like. So
+does the magnitude: with `--output-len 128` every request spends its last 4
+tokens inside the window, so across 16 active decodes the chance that *some*
+request sits in the window is `1 − (31/32)^16 ≈ 40%`, i.e. about two in five
+prefill-bearing steps are forced to budget 0. Clause (2) cannot contribute here —
+a 1024-token prompt against the 1024 base budget makes the FIFO-front cap a
+no-op.
+
+The attribution is falsifiable: the window share is `4/output_len`, so a
+`1024/512` cell should drop the hit rate to ~12% and shrink the throughput gap
+with it. Run that cell before quoting the mechanism as established.
 
 Ops note for future preemptible re-runs: keep heartbeat aggressive (≤5s + GPU
 query), write all artifacts under `/user/...` on the **same** cluster FS, and

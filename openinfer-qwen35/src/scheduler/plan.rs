@@ -369,6 +369,45 @@ mod tests {
         );
     }
 
+    /// The FIFO-front cap also decides how many queued prefills one step can
+    /// drain, because `take_prefill_chunks` spends the step budget across the
+    /// queue: `off` co-packs the next request, `auto` does not.
+    #[test]
+    fn adaptive_prefill_budget_stops_step_from_copacking_queued_prefills() {
+        let active = [ActiveDecodeState {
+            generated_count: 16,
+            max_tokens: 8192,
+        }];
+        let prefilling = [
+            PrefillQueueState {
+                remaining_tokens: 512,
+            },
+            PrefillQueueState {
+                remaining_tokens: 4096,
+            },
+        ];
+
+        let off = choose_prefill_budget(Qwen35SchedulerPolicy::Off, 1024, &active, &prefilling);
+        let auto = choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling);
+        assert_eq!(off, 1024, "off spends the full budget across the queue");
+        assert_eq!(
+            auto, 512,
+            "auto caps the step at the FIFO-front request's remaining prompt"
+        );
+
+        let remaining = [512, 4096];
+        assert_eq!(
+            plan_prefill_chunks(&remaining, off),
+            vec![512, 512],
+            "off co-packs the next queued prefill into the same step"
+        );
+        assert_eq!(
+            plan_prefill_chunks(&remaining, auto),
+            vec![512],
+            "auto forwards only the FIFO-front request this step"
+        );
+    }
+
     #[test]
     fn adaptive_prefill_budget_prioritizes_decode_when_active_request_is_finishing() {
         let active = [
