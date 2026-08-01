@@ -2,15 +2,16 @@
 
 > **TL;DR:** Issue #727 policy plumbing stays default-`off` / opt-in `auto` with
 > a hard `--max-prefill-tokens` cap and TP rejection of `auto`. Independent
-> acceptance on **1×RTX 4090** (`scripts/sweep_727.sh`, commit `428c037`) shows
-> `auto` vs `off` **neutral** on standard/long-output cells (deltas ≤0.5%) and
-> **no mixed-tail regression** under the #470 `ITL_STEP` validity gate (all
-> wider-batch mixed cells valid; `max_batch==bg` negctl correctly invalid).
-> HTTP `1024/128` QPS 8/12/16 A/B is in the harness; re-persist after the first
-> 4090 host was idle-killed mid-run (see Status). Decode-finish *improvement*
-> still needs the `mixed.rs` replenish follow-up.
+> acceptance on **1×RTX 4090** (`scripts/sweep_727.sh` + HTTP QPS, tip `ded5fee`,
+> task `650826`) shows `auto` vs `off` **neutral** on standard/long-output
+> (deltas ≤0.5%, identical hash0) and **no mixed-tail regression** under the
+> #470 `ITL_STEP` gate (16/16 wider-batch cells `stall_at_bg>0`; negctl
+> `decode_n==bg` absent + starvation warning). HTTP `1024/128` QPS 8/12/16:
+> ITL p99 matches; out tok/s −3.2%…−5.6% and TTFT p50 slightly higher on
+> `auto` — report, do not hide. Decode-finish *improvement* still needs the
+> `mixed.rs` replenish follow-up.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Preparation
 
@@ -150,8 +151,8 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
   - A `max_batch=4,bg=4` mixed cell is a negative control, not evidence of overlap.
   - Qwen3.5 TP should reject `auto` until TP supports unified mixed steps.
 - **Follow-ups**:
-  - **Persist HTTP QPS A/B** (`1024/128` @ qps 8/12/16, off vs auto) to shared storage after the first 4090 host (`tasks/645702`) was idle-killed mid-run; in-process sweep evidence below already stands.
   - **Exercise `auto` cleanly**: add a background-stream replenish option to `mixed.rs` so active decodes reach the ≤4-token decode-finish window while a cold prefill is in flight — the only way to turn the "clear mixed-load ITL tail improvement" criterion into a measurable cell (see the measurement gap in the Independent Validation Track section).
+  - HTTP QPS A/B is now persisted under `/user/xurui1/oi727/datasets/qwen35-727-validation/` (task `650826`); see Status below.
 
 ## Independent Validation Track (#727 acceptance)
 
@@ -203,74 +204,82 @@ criteria (no regression, explicit failures, retained output hashes, disableable
 - Policy-decision unit coverage already lives in `scheduler/plan.rs`
   (`adaptive_prefill_budget_*`); this track only adds serving-level evidence.
 
-### Status — 4090 acceptance (in-process sweep complete)
+### Status — 4090 acceptance (in-process + HTTP QPS complete)
 
-Validation host (separate baseline from the §5 RTX 5090 pre-review cells; do
-**not** compare absolute latencies across hosts):
+Two preemptible 4090 hosts; absolute latencies are host-local (do **not**
+compare across hosts or against the §5 RTX 5090 pre-review cells). Results for
+the completed matrix live on shared JuiceFS:
+`/user/xurui1/oi727/datasets/qwen35-727-validation/`.
 
-| Field | Value |
-| --- | --- |
-| GPU | 1× NVIDIA GeForce RTX 4090 24GB (Cybertron `openinfer-dev` / `paratera_ningxia`, task `645702`) |
-| Driver / CUDA | driver `570.133.07`, `nvcc 12.1` |
-| Rust | `nightly-2026-07-10` |
-| Source | branch tip `428c037` (`chore/qwen35-727-validation-0c33`) |
-| Feature / model | `qwen35`, `models/Qwen3.5-4B` (`model_type=qwen3_5`) |
-| Build env | `OPENINFER_CUDA_SM=89`, `OPENINFER_SKIP_SUBMODULE_INIT=1` (qwen35 only needs flashinfer+cutlass/spdlog/cccl), Triton `3.7.1` |
-| Sweep | `scripts/sweep_727.sh` — **24/24 cells `exit=0`**, `SWEEP_DONE` 2026-07-31T06:06:44Z |
+| Field | First pass (`645702`) | Re-persist (`650826`) |
+| --- | --- | --- |
+| GPU | 1× RTX 4090 24GB (`paratera_ningxia` / `wind-tunnel`) | same |
+| Driver / CUDA | `570.133.07` / `nvcc 12.1` | same image |
+| Rust | `nightly-2026-07-10` | same |
+| Source | tip `428c037` | tip `ded5fee` |
+| Feature / model | `qwen35`, `Qwen3.5-4B` | same |
+| Build env | `OPENINFER_CUDA_SM=89`, `OPENINFER_SKIP_SUBMODULE_INIT=1`, Triton `3.7.1` | same |
+| Keepalive | weak; idle-killed mid-QPS | `oi727hb` every **5s** (touch + `nvidia-smi` + CPU blip) |
+| In-process | **24/24 `exit=0`**, `SWEEP_DONE` 2026-07-31T06:06:44Z | **24/24 `exit=0`**, `SWEEP_DONE` 2026-08-01T02:48:31Z |
+| HTTP QPS | killed before copy-out | **6/6 JSON**, `ORCH_DONE` 2026-08-01T03:02:58Z |
 
-Standard / long-output request A/B (synthetic greedy; CUDA Graph on; hash0
-identical off vs auto):
+Standard / long-output request A/B on `650826` (synthetic greedy; CUDA Graph on;
+hash0 identical off vs auto):
 
 | Policy | Cell | TTFT p50 ms | steady TPOT p50/p99 ms | request tok/s | out len | hash0 |
 | --- | --- | ---: | ---: | ---: | --- | --- |
-| `off` | 1024/256 c1 | 64.838 | 10.925 / 11.020 | 89.80 | 256 | `0827a7035c7b7a89` |
-| `auto` | 1024/256 c1 | 65.185 | 10.920 / 11.006 | 89.84 | 256 | `0827a7035c7b7a89` |
-| `off` | 1024/256 c16 | 677.727 | 15.004 / 79.230 | 51.76 | 256 | `0827a7035c7b7a89` |
-| `auto` | 1024/256 c16 | 678.530 | 15.061 / 79.558 | 51.60 | 256 | `0827a7035c7b7a89` |
-| `off` | 1024/2048 c8 | 372.810 | 12.729 / 13.359 | 76.98 | 2048 | `dc6c576de0d38289` |
-| `auto` | 1024/2048 c8 | 373.581 | 12.781 / 13.375 | 76.79 | 2048 | `dc6c576de0d38289` |
+| `off` | 1024/256 c1 | 66.261 | 10.971 / 11.157 | 89.35 | 256 | `0827a7035c7b7a89` |
+| `auto` | 1024/256 c1 | 66.216 | 10.965 / 11.147 | 89.41 | 256 | `0827a7035c7b7a89` |
+| `off` | 1024/256 c16 | 688.500 | 15.232 / 80.632 | 50.98 | 256 | `0827a7035c7b7a89` |
+| `auto` | 1024/256 c16 | 691.312 | 15.233 / 80.678 | 50.95 | 256 | `0827a7035c7b7a89` |
+| `off` | 1024/2048 c8 | 379.200 | 12.982 / 13.691 | 75.41 | 2048 | `dc6c576de0d38289` |
+| `auto` | 1024/2048 c8 | 379.555 | 12.933 / 13.606 | 75.87 | 2048 | `dc6c576de0d38289` |
 
-`(auto−off)/off` deltas: TTFT ≤ +0.53%, TPOT p50 ≤ +0.41%, TPOT p99 ≤ +0.41% —
-**no material regression** on the fixed-chunk path.
+`(auto−off)/off` deltas: TTFT ≤ +0.41%, TPOT p50 ≤ +0.01%, TPOT p99 ≤ +0.06% —
+**no material regression** on the fixed-chunk path (matches the first-pass
+conclusion; hashes unchanged).
 
 Mixed-load `#470` `ITL_STEP` validity (stall step with `prefill_tok>0` and
-`decode_n == bg_concurrency`):
+`decode_n == bg_concurrency`; from `scripts/itl_step_agg.py` on cell `.log`):
 
 | Cell family | off valid? | auto valid? |
 | --- | --- | --- |
-| `mixed_bg{8,16}_mb{16,32}_p{4096,8192}_q{0p5,1p0}_*` (16 cells) | yes (`stall_at_bg` > 0) | yes |
-| `mixed_negctl_bg8_mb8_*` (`max_batch == bg`) | **no** (`stall_at_bg=0`, starvation warning) | **no** |
+| `mixed_bg{8,16}_mb{16,32}_p{4096,8192}_q{0p5,1p0}_*` (16 cells) | yes (`decode_n=bg` stall steps > 0) | yes |
+| `mixed_negctl_bg8_mb8_*` (`max_batch == bg`) | **no** (no `decode_n=8` stalls; starvation warning) | **no** |
 
-Representative stall ITL from `itl_step_agg.py` (`mixed_bg8_mb16_p4096_q0p5`):
+Representative true per-step stall ITL (`mixed_bg8_mb16_p4096_q0p5`,
+`itl_step_agg.py` on `.log`):
 
 | Policy | stall p50/p99/max ms | steady decode p50/p99 ms | stall steps @ `decode_n=8` |
 | --- | ---: | ---: | ---: |
-| `off` | 78.33 / 83.00 / 91.69 | 12.25 / 12.82 | 40 |
-| `auto` | 47.81 / 79.18 / 79.30 | 12.25 / 12.75 | 40 |
+| `off` | 79.58 / 85.55 / 88.45 | 12.31 / 12.87 | 40 |
+| `auto` | 48.48 / 83.75 / 84.71 | 12.34 / 12.86 | 40 |
 
 Interpretation: under the long-lived-background matrix, `auto` does **not**
 regress the true per-step stall / steady decode tails vs `off`, and the
 negctl still detects slot starvation. This does **not** claim a decode-finish
 tick improvement (measurement gap above).
 
-HTTP QPS pressure (`tools/bench/run_serving_bench.sh`, `1024/128`, qps 8/12/16,
-`MAX_BATCH=16`, `FEATURES=qwen35`): harness exercised on the same host; the
-preemptible / idle-auto-release window killed the pod before results were
-copied off `/root`. Re-run on a fresh 4090 with results under `/user/...` and
-paste the summarize table here. Harness fix landed: empty
-`CONCURRENCY_LIST=` must disable the concurrency sweep (`:-` → `-` in
-`run_serving_bench.sh`).
+HTTP QPS pressure on `650826` (`tools/bench/run_serving_bench.sh`, `1024/128`,
+qps 8/12/16, `MAX_BATCH=16`, `FEATURES=qwen35`, `CONCURRENCY_LIST=` empty,
+`SKIP_BUILD=1`, `SECONDS_PER_RUN=60`, shared seeds per qps):
 
-Resume / re-persist:
+| Policy | qps | completed | req/s | out tok/s | TTFT p50/p99 ms | TPOT p50/p99 ms | ITL p99 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `off` | 8 | 480 | 5.25 | 672.0 | 14423 / 29891 | 23.15 / 23.38 | 82.60 |
+| `auto` | 8 | 480 | 5.03 | 644.4 | 16326 / 33057 | 22.14 / 23.37 | 82.97 |
+| `off` | 12 | 720 | 5.25 | 671.4 | 36798 / 75068 | 23.27 / 23.45 | 82.81 |
+| `auto` | 12 | 720 | 5.07 | 649.6 | 38705 / 79656 | 22.15 / 23.30 | 83.00 |
+| `off` | 16 | 960 | 5.28 | 675.3 | 59217 / 119843 | 23.19 / 23.50 | 82.69 |
+| `auto` | 16 | 960 | 4.98 | 637.6 | 63750 / 128829 | 19.63 / 23.07 | 82.63 |
 
-```bash
-export OPENINFER_SKIP_SUBMODULE_INIT=1 OPENINFER_CUDA_SM=89
-cargo build --release -p openinfer-server --features qwen35
-MODEL=<abs Qwen3.5-4B> DATA=<abs shared outdir> scripts/sweep_727.sh
-FEATURES=qwen35 QWEN35_SCHED_POLICY=off  MAX_BATCH=16 QPS_LIST='8 12 16' \
-  CONCURRENCY_LIST= INPUT_LEN=1024 OUTPUT_LEN=128 SKIP_BUILD=1 \
-  MODEL=$MODEL RESULT_DIR=$DATA/qps_off  tools/bench/run_serving_bench.sh
-FEATURES=qwen35 QWEN35_SCHED_POLICY=auto MAX_BATCH=16 QPS_LIST='8 12 16' \
-  CONCURRENCY_LIST= INPUT_LEN=1024 OUTPUT_LEN=128 SKIP_BUILD=1 \
-  MODEL=$MODEL RESULT_DIR=$DATA/qps_auto tools/bench/run_serving_bench.sh
-```
+`(auto−off)/off` on out tok/s: −4.1% / −3.2% / −5.6% at qps 8/12/16. ITL p99 is
+flat; TPOT p50 is slightly *better* on `auto`. Completions = prompts (0
+failures). Treat the throughput/TTFT delta as **reported**, not hidden; it is
+within the open-loop saturated regime where both policies already deliver
+~5.0–5.3 req/s against offered 8–16.
+
+Ops note for future preemptible re-runs: keep heartbeat aggressive (≤5s + GPU
+query), write all artifacts under `/user/...` on the **same** cluster FS, and
+set `OPENINFER_SKIP_SUBMODULE_INIT=1` so qwen35 builds do not recurse into
+unused DeepEP/FlashMLA/DeepGEMM submodules.
