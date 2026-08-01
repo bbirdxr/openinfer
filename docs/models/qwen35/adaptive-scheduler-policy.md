@@ -192,8 +192,8 @@ consequences drive the matrix:
   ≤4-token window out of reach (4/8192 per background stream), so clause (1)
   effectively never fires here: these cells prove `auto` does **not** regress the
   mixed tail; they do not show a decode-finish tail *improvement*. Clause (2) can
-  still bind, because `--bg-prompt-len 512` sits below the 1024 base budget —
-  see the unattributed stall p50 drop in Status.
+  does bind, because `--bg-prompt-len 512` sits below the 1024 base budget —
+  that is what produces the stall p50 drop analysed in Status.
 
 **Open measurement gap.** Cleanly exercising the decode-finish tick needs active
 decodes that reach completion *while a cold prefill is in flight*. The current
